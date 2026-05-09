@@ -1,0 +1,14 @@
+node_modules/
+.env
+.env.local
+.env.production
+.env.*.local
+dist/
+build/
+.expo/
+*.log
+.DS_Store
+.wa-sessions/
+*.sqlite
+*.sqlite3
+.vercel/

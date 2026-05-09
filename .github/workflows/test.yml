@@ -1,0 +1,47 @@
+# CI pipeline — runs backend tests on every push to main and on all pull requests.
+
+name: Backend Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Run Jest test suite
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: npm ci
+
+      - name: Run tests
+        working-directory: backend
+        run: npm test
+        env:
+          # Tests mock Redis and Postgres — only the JWT secret is needed for signing tokens in tests
+          JWT_SECRET:     test_jwt_secret_do_not_use_in_production
+          NODE_ENV:       test
+          ANTHROPIC_API_KEY: ""   # mocked in setup.js
+          STRIPE_SECRET_KEY: ""   # mocked in setup.js
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: backend/coverage/
+          retention-days: 7

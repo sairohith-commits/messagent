@@ -1,0 +1,69 @@
+# Local development stack — backend + PostgreSQL + Redis
+# Usage: docker compose up --build
+
+services:
+
+  # ── PostgreSQL 16 ────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       messagent
+      POSTGRES_USER:     messagent
+      POSTGRES_PASSWORD: messagent_dev
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./src/db/schema.sql:/docker-entrypoint-initdb.d/001_schema.sql
+      - ./src/db/008_subscriptions.sql:/docker-entrypoint-initdb.d/008_subscriptions.sql
+    ports:
+      - "5434:5432"   # 5432 occupied by native PostgreSQL on this machine
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U messagent"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── Redis 7 ──────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --save 60 1 --loglevel warning
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── Messagent backend ────────────────────────────────────────────────────────
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL:   postgresql://messagent:messagent_dev@postgres:5432/messagent
+      REDIS_HOST:     redis
+      REDIS_PORT:     "6379"
+      REDIS_PASSWORD: ""
+      NODE_ENV:       development
+    ports:
+      - "4000:4000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:4000/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
+  redis_data:

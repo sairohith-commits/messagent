@@ -1,0 +1,14 @@
+{
+  "name": "messagent",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "backend",
+    "mobile",
+    "shared"
+  ],
+  "scripts": {
+    "dev:backend": "yarn workspace backend dev",
+    "dev:mobile": "yarn workspace mobile start"
+  }
+}
