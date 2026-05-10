@@ -6,6 +6,9 @@
     "development": {
       "developmentClient": true,
       "distribution": "internal",
+      "env": {
+        "EXPO_PUBLIC_API_URL": "https://messagent-backend-production.up.railway.app"
+      },
       "ios": {
         "simulator": true
       },
@@ -16,6 +19,9 @@
     },
     "preview": {
       "distribution": "internal",
+      "env": {
+        "EXPO_PUBLIC_API_URL": "https://messagent-backend-production.up.railway.app"
+      },
       "ios": {
         "resourceClass": "m-medium"
       },
@@ -25,6 +31,9 @@
     },
     "production": {
       "autoIncrement": true,
+      "env": {
+        "EXPO_PUBLIC_API_URL": "https://messagent-backend-production.up.railway.app"
+      },
       "ios": {
         "resourceClass": "m-medium"
       },

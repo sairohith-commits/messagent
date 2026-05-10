@@ -1,0 +1,7 @@
+node_modules/
+.expo/
+*.log
+.DS_Store
+.env
+.env.local
+.env.production
