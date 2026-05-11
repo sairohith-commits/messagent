@@ -17,14 +17,39 @@ const { query } = require('../db');
  *   - subject  — Email subject line
  * @returns {Promise<object>} The created message row
  */
+/**
+ * Insert a new incoming message record.
+ * Returns null (instead of throwing) if the platform_message_id is already in the DB,
+ * allowing callers to detect and skip duplicate webhook deliveries.
+ *
+ * @param {string} userId
+ * @param {string} platform
+ * @param {string} fromContact
+ * @param {string} body
+ * @param {{ threadId?: string, subject?: string, platformMessageId?: string }} [meta]
+ * @returns {Promise<object|null>} The created row, or null on duplicate
+ */
 async function saveMessage(userId, platform, fromContact, body, meta = {}) {
-  const { threadId = null, subject = null } = meta;
+  const { threadId = null, subject = null, platformMessageId = null } = meta;
+
+  // Deduplication: if a platform-native message ID is provided, check for an existing row
+  // before inserting. This prevents double-processing when the webhook is delivered twice.
+  if (platformMessageId) {
+    const { rows: existing } = await query(
+      `SELECT id FROM messages
+       WHERE user_id = $1 AND platform = $2 AND platform_message_id = $3
+       LIMIT 1`,
+      [userId, platform, platformMessageId],
+    );
+    if (existing.length) return null;
+  }
+
   const sql = `
-    INSERT INTO messages (user_id, platform, from_contact, body, thread_id, subject)
-    VALUES ($1, $2, $3, $4, $5, $6)
+    INSERT INTO messages (user_id, platform, from_contact, body, thread_id, subject, platform_message_id)
+    VALUES ($1, $2, $3, $4, $5, $6, $7)
     RETURNING id, user_id, platform, from_contact, body, thread_id, subject, status, received_at
   `;
-  const { rows } = await query(sql, [userId, platform, fromContact, body, threadId, subject]);
+  const { rows } = await query(sql, [userId, platform, fromContact, body, threadId, subject, platformMessageId]);
   return rows[0];
 }
 

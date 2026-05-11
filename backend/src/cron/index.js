@@ -5,6 +5,7 @@
 const cron = require('node-cron');
 const { renewAllGmailWatches } = require('./gmailWatchRenewer');
 const { runDailySummary }      = require('../workers/summaryWorker');
+const { query }                = require('../db');
 
 /**
  * Start all cron jobs.
@@ -38,6 +39,26 @@ function startCronJobs() {
   }, {
     timezone: 'UTC',
   });
+
+  // ─── Stale pending_approval cleanup ────────────────────────────────────────
+  // Suggested replies that sit unreviewed for more than 48h are automatically
+  // marked as skipped — they're too old to send and were blocking the queue.
+  // Run hourly so no message lingers more than ~1h past the 48h deadline.
+  cron.schedule('0 * * * *', async () => {
+    try {
+      const { rowCount } = await query(
+        `UPDATE messages
+         SET    status = 'skipped'
+         WHERE  status      = 'pending_approval'
+           AND  received_at < NOW() - INTERVAL '48 hours'`,
+      );
+      if (rowCount > 0) {
+        console.info(`[cron] Cleaned up ${rowCount} stale pending_approval message(s)`);
+      }
+    } catch (err) {
+      console.error('[cron] Stale pending_approval cleanup failed:', err.message);
+    }
+  }, { timezone: 'UTC' });
 
   console.info('[cron] All cron jobs scheduled');
 }

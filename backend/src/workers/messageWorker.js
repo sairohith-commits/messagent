@@ -7,26 +7,31 @@ const { Worker } = require('bullmq');
 const { redisConnection } = require('../queues/messageQueue');
 const { addReplyJob } = require('../queues/replyQueue');
 const { updateMessageStatus } = require('../models/message');
-const { getUserById } = require('../models/user');
-const { query } = require('../db');
+const { getUserById }         = require('../models/user');
+const { query }               = require('../db');
+const { isRateLimited }       = require('../services/rateLimiter');
 
 // ─── AUTOMATED EMAIL FILTER (second-pass safety check) ───────────────────────
 // Primary filtering happens in gmail.js; this catches anything that slipped through.
 
+// Keep in sync with gmail.js — this second-pass filter catches anything that slipped through
 const SKIP_FROM_PATTERNS = [
   'noreply', 'no-reply', 'donotreply', 'do-not-reply',
-  'mailer-daemon', 'postmaster', 'automated',
-  'notifications', 'bounce',
+  'mailer-daemon', 'postmaster', 'automated', 'auto-confirm',
+  'notifications', 'bounce', 'no.reply', 'do.not.reply',
 ];
 
 const SKIP_DOMAINS = [
   'mailchimp.com', 'sendgrid.net', 'amazonses.com', 'exacttarget.com',
   'marketo.com', 'hubspot.com', 'klaviyo.com', 'constantcontact.com',
+  'mailgun.org', 'sparkpost.com', 'postmarkapp.com', 'mandrill.com',
 ];
 
 const SKIP_SUBJECT_PREFIXES = [
-  'unsubscribe', 're: ', '[automated]', 'auto-reply',
-  'out of office', 'delivery status', 'mailer-daemon',
+  'auto:', 'auto-reply', 'automated reply', 'automated response',
+  '[automated]', 'out of office', 'delivery status', 'delivery failure',
+  'mail delivery', 'returned mail', 'undeliverable', 'undelivered mail',
+  'mailer-daemon', 'failure notice', 'delivery notification',
 ];
 
 /**
@@ -105,7 +110,15 @@ const worker = new Worker(
       return;
     }
 
-    // 2. Load platform config
+    // 2. Rate-limit check — skip if we already replied to this sender in the last 24h
+    //    (catches auto-responder loops on WhatsApp/Instagram where In-Reply-To isn't available)
+    if (await isRateLimited(userId, platform, fromContact)) {
+      await updateMessageStatus(messageId, 'skipped');
+      console.info(`[messageWorker] Rate-limited: already replied to ${fromContact} within 24h`);
+      return;
+    }
+
+    // 3. Load platform config
     const config = await getPlatformConfig(userId, platform);
 
     if (!config || !config.enabled) {
@@ -114,7 +127,7 @@ const worker = new Worker(
       return;
     }
 
-    // 3. Check schedule window
+    // 4. Check schedule window
     if (!isWithinSchedule(config.schedule_start, config.schedule_end)) {
       await updateMessageStatus(messageId, 'skipped');
       console.info(`[messageWorker] Skipped msg ${messageId} — outside schedule`);

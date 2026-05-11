@@ -9,7 +9,8 @@ const { generateReply } = require('../services/agentService');
 const { updateMessageStatus } = require('../models/message');
 const { saveSuggestedReply } = require('../models/suggestedReply');
 const { notifyPendingReply } = require('../services/pushService');
-const { query } = require('../db');
+const { recordReply }        = require('../services/rateLimiter');
+const { query }              = require('../db');
 
 const gmail              = require('../services/gmail');
 const whatsapp           = require('../services/whatsapp');
@@ -26,13 +27,40 @@ const instagramPersonal  = require('../services/instagramPersonal');
  * @param {Date|null} sentAt
  * @returns {Promise<string>} New reply_log id
  */
-async function saveReplyLog(userId, messageId, replyBody, modelUsed, sentAt) {
+/**
+ * Truncate reply text at the last sentence boundary before maxChars.
+ * Prevents runaway replies from exceeding the cost budget.
+ */
+function truncateAtSentence(text, maxChars = 500) {
+  if (text.length <= maxChars) return text;
+  const cut = text.slice(0, maxChars);
+  const lastBoundary = Math.max(
+    cut.lastIndexOf('. '),
+    cut.lastIndexOf('! '),
+    cut.lastIndexOf('? '),
+    cut.lastIndexOf('.\n'),
+  );
+  // Only truncate at a sentence boundary if it's in the second half of the window
+  if (lastBoundary > maxChars * 0.5) {
+    return cut.slice(0, lastBoundary + 1).trim();
+  }
+  return cut.trimEnd() + '…'; // ellipsis if no good boundary found
+}
+
+/**
+ * Persist a reply log entry.
+ */
+async function saveReplyLog(userId, messageId, replyBody, modelUsed, sentAt, inputTokens, outputTokens, platformMessageId) {
   const sql = `
-    INSERT INTO reply_logs (user_id, message_id, reply_body, model_used, sent_at)
-    VALUES ($1, $2, $3, $4, $5)
+    INSERT INTO reply_logs
+      (user_id, message_id, reply_body, model_used, sent_at, input_tokens, output_tokens, platform_message_id)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
     RETURNING id
   `;
-  const { rows } = await query(sql, [userId, messageId, replyBody, modelUsed, sentAt]);
+  const { rows } = await query(sql, [
+    userId, messageId, replyBody, modelUsed, sentAt,
+    inputTokens ?? 0, outputTokens ?? 0, platformMessageId ?? null,
+  ]);
   return rows[0].id;
 }
 
@@ -47,37 +75,38 @@ async function saveReplyLog(userId, messageId, replyBody, modelUsed, sentAt) {
  * @param {string|null} threadId      Gmail thread ID (null for non-Gmail platforms)
  * @returns {Promise<Date|null>}
  */
+/**
+ * Dispatch the generated reply via the correct platform service.
+ * Returns { sentAt, platformMessageId } on success; sentAt is null if platform not integrated.
+ */
 async function dispatchReply(platform, userId, fromContact, replyBody, threadId) {
   switch (platform) {
-    case 'gmail':
+    case 'gmail': {
       if (!threadId) {
         console.error('[replyWorker] Gmail reply missing threadId — cannot send');
-        return null;
+        return { sentAt: null, platformMessageId: null };
       }
-      // gmail.sendReply handles token refresh internally
-      await gmail.sendReply(userId, threadId, fromContact, replyBody);
-      return new Date();
+      const gmailMsgId = await gmail.sendReply(userId, threadId, fromContact, replyBody);
+      return { sentAt: new Date(), platformMessageId: gmailMsgId };
+    }
 
     case 'whatsapp':
-      // threadId is the WhatsApp JID when using Baileys personal; null for Business API
       await whatsapp.sendReply(userId, fromContact, replyBody, threadId);
-      return new Date();
+      return { sentAt: new Date(), platformMessageId: null };
 
     case 'instagram': {
-      // Route to personal (polling) if an active session exists, else Business API
       const igPersonalState = instagramPersonal.getPersonalState(userId);
       if (igPersonalState.status === 'connected' && threadId) {
         await instagramPersonal.sendInstagramReply(userId, threadId, replyBody);
       } else {
         await instagram.sendReply(userId, fromContact, replyBody);
       }
-      return new Date();
+      return { sentAt: new Date(), platformMessageId: null };
     }
 
     default:
-      // instagram, telegram — placeholder until their services are integrated
       console.warn(`[replyWorker] No send implementation for platform: ${platform}`);
-      return null;
+      return { sentAt: null, platformMessageId: null };
   }
 }
 
@@ -92,14 +121,20 @@ const worker = new Worker(
     // 1. Choose model based on tier
     const model = (tier === 'free') ? 'gemma' : 'claude';
 
-    // 2. Generate the reply text
-    const replyBody = await generateReply({
+    // 2. Generate the reply text (returns { reply, inputTokens, outputTokens })
+    const { reply: rawReply, inputTokens, outputTokens } = await generateReply({
       message:          body,
       mode,
       model,
       userName,
       userInstructions,
     });
+
+    // 2a. Enforce 500-char hard cap — truncate at last sentence boundary
+    const replyBody = truncateAtSentence(rawReply, 500);
+    if (replyBody.length < rawReply.length) {
+      console.info(`[replyWorker] Reply truncated from ${rawReply.length} to ${replyBody.length} chars`);
+    }
 
     // 3. Suggest mode — save for human review, do not dispatch
     if (replyMode === 'suggest') {
@@ -126,15 +161,19 @@ const worker = new Worker(
     }
 
     // 4. Auto mode — dispatch immediately
-    const sentAt = await dispatchReply(platform, userId, fromContact, replyBody, threadId);
+    const { sentAt, platformMessageId } = await dispatchReply(platform, userId, fromContact, replyBody, threadId);
     await updateMessageStatus(messageId, 'replied');
 
-    // 5. Persist reply log
-    await saveReplyLog(userId, messageId, replyBody, model, sentAt);
+    // 5. Record rate limit so this sender is blocked for 24h (cross-platform safety net)
+    await recordReply(userId, platform, fromContact);
+
+    // 6. Persist reply log with token usage and platform message ID
+    await saveReplyLog(userId, messageId, replyBody, model, sentAt, inputTokens, outputTokens, platformMessageId);
 
     console.info(
-      `[replyWorker] Processed msg ${messageId} via ${model} on ${platform}` +
-      (sentAt ? '' : ' (draft only — platform not yet integrated)'),
+      `[replyWorker] Processed msg ${messageId} via ${model} on ${platform} ` +
+      `(in: ${inputTokens} out: ${outputTokens} tokens)` +
+      (sentAt ? '' : ' — draft only, platform not yet integrated'),
     );
   },
   { connection: redisConnection, concurrency: 3 }

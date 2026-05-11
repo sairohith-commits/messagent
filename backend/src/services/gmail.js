@@ -8,6 +8,7 @@ const { query }   = require('../db');
 const { saveToken, getToken } = require('../models/platformToken');
 const { saveMessage }         = require('../models/message');
 const { addMessageJob }       = require('../queues/messageQueue');
+const { recordReply }         = require('./rateLimiter');
 
 // ─── OAUTH2 FACTORY ──────────────────────────────────────────────────────────
 
@@ -221,18 +222,22 @@ async function setupGmailWatch(userId) {
 
 const SKIP_FROM_PATTERNS = [
   'noreply', 'no-reply', 'donotreply', 'do-not-reply',
-  'mailer-daemon', 'postmaster', 'automated',
-  'notifications', 'bounce',
+  'mailer-daemon', 'postmaster', 'automated', 'auto-confirm',
+  'notifications', 'bounce', 'support+', 'alert@', 'alerts@',
+  'no.reply', 'do.not.reply',
 ];
 
 const SKIP_DOMAINS = [
   'mailchimp.com', 'sendgrid.net', 'amazonses.com', 'exacttarget.com',
   'marketo.com', 'hubspot.com', 'klaviyo.com', 'constantcontact.com',
+  'mailgun.org', 'sparkpost.com', 'postmarkapp.com', 'mandrill.com',
 ];
 
 const SKIP_SUBJECT_PREFIXES = [
-  'unsubscribe', 're: ', '[automated]', 'auto-reply',
-  'out of office', 'delivery status', 'mailer-daemon',
+  'auto:', 'auto-reply', 'automated reply', 'automated response',
+  '[automated]', 'out of office', 'delivery status', 'delivery failure',
+  'mail delivery', 'returned mail', 'undeliverable', 'undelivered mail',
+  'mailer-daemon', 'failure notice', 'delivery notification',
 ];
 
 /**
@@ -258,14 +263,18 @@ function shouldSkipEmail(fromEmail, subject, headers, userEmail) {
   // 3. Subject line starts with an automated-message prefix
   if (SKIP_SUBJECT_PREFIXES.some((p) => subjectLower.startsWith(p))) return true;
 
-  // 4. Automation headers
-  const autoSubmitted = getHeader(headers, 'Auto-Submitted').toLowerCase();
-  const autoReply     = getHeader(headers, 'X-Autoreply').toLowerCase();
-  const precedence    = getHeader(headers, 'Precedence').toLowerCase();
+  // 4. Automation headers — check both canonical and X- prefixed variants
+  const autoSubmitted  = getHeader(headers, 'Auto-Submitted').toLowerCase();
+  const xAutoSubmitted = getHeader(headers, 'X-Auto-Submitted').toLowerCase();
+  const autoReply      = getHeader(headers, 'X-Autoreply').toLowerCase();
+  const xAutorespond   = getHeader(headers, 'X-Autorespond').toLowerCase();
+  const precedence     = getHeader(headers, 'Precedence').toLowerCase();
 
-  if (autoSubmitted === 'auto-generated' || autoSubmitted === 'auto-replied') return true;
+  if (autoSubmitted && autoSubmitted !== 'no') return true;   // RFC 3834: any non-"no" value = automated
+  if (xAutoSubmitted && xAutoSubmitted !== 'no') return true;
   if (autoReply === 'yes') return true;
-  if (['bulk', 'list', 'junk'].includes(precedence)) return true;
+  if (xAutorespond) return true;                              // presence alone indicates auto-response
+  if (['bulk', 'list', 'junk', 'auto_reply'].includes(precedence)) return true;
 
   // 5. Loop prevention — never reply to our own Gmail address
   if (userEmail && emailLower.includes(userEmail.toLowerCase())) return true;
@@ -434,8 +443,9 @@ async function processIncomingGmailMessage(gmail, userId, userEmail, gmailMsgId,
   const msgData = msgRes.data;
   const headers = msgData.payload?.headers ?? [];
 
-  const from    = getHeader(headers, 'From');
-  const subject = getHeader(headers, 'Subject');
+  const from      = getHeader(headers, 'From');
+  const subject   = getHeader(headers, 'Subject');
+  const inReplyTo = getHeader(headers, 'In-Reply-To').trim();
 
   // Skip messages sent by the user themselves (e.g. Sent folder spillover)
   if (from.includes(userEmail)) {
@@ -450,6 +460,22 @@ async function processIncomingGmailMessage(gmail, userId, userEmail, gmailMsgId,
   if (shouldSkipEmail(fromContact, subject, headers, userEmail)) {
     console.info(`[gmail] Skipped automated email from ${fromContact}`);
     return;
+  }
+
+  // Loop detection — if In-Reply-To points to a message we sent, this is an
+  // auto-response to our reply (the classic infinite-loop trigger). Skip it.
+  if (inReplyTo) {
+    const { rows: sentRows } = await query(
+      `SELECT id FROM reply_logs
+       WHERE  user_id             = $1
+         AND  platform_message_id = $2
+       LIMIT  1`,
+      [userId, inReplyTo],
+    );
+    if (sentRows.length) {
+      console.info(`[gmail] Skipping reply-to-our-reply: In-Reply-To ${inReplyTo}`);
+      return;
+    }
   }
 
   // Skip if the user started this thread (fetch thread's first message)
@@ -473,8 +499,16 @@ async function processIncomingGmailMessage(gmail, userId, userEmail, gmailMsgId,
     return;
   }
 
-  // Persist the message and enqueue it for agent processing
-  const savedMsg = await saveMessage(userId, 'gmail', fromContact, body, { threadId, subject });
+  // Deduplication — save returns null if this platform message ID was already processed
+  const savedMsg = await saveMessage(userId, 'gmail', fromContact, body, {
+    threadId,
+    subject,
+    platformMessageId: gmailMsgId,
+  });
+  if (!savedMsg) {
+    console.info(`[gmail] Duplicate message ${gmailMsgId} — already processed`);
+    return;
+  }
 
   await addMessageJob({
     messageId:   savedMsg.id,
@@ -485,6 +519,11 @@ async function processIncomingGmailMessage(gmail, userId, userEmail, gmailMsgId,
     threadId,
     subject,
   });
+
+  // Record the reply rate-limit key for this sender now that we've queued a reply.
+  // This prevents auto-responder loops: if this sender replies again within 24h,
+  // messageWorker will drop it via isRateLimited().
+  await recordReply(userId, 'gmail', fromContact);
 
   console.info(`[gmail] Enqueued message ${gmailMsgId} (thread ${threadId}) for user ${userId}`);
 }
